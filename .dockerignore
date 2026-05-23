@@ -1,0 +1,7 @@
+lib/downward/builds
+.venv
+__pycache__
+*.pyc
+.env
+instance
+temp
