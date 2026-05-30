@@ -40,6 +40,35 @@ class SessionContext:
         self.facets = normalize_facets(self.service.send_command("?"))
         return self.facets
 
+    def select_facet(self, facet_id: str, selection_state: str, previous_state=None):
+        command = build_selection_command(facet_id, selection_state, previous_state)
+        if command:
+            self.service.send_command(command, no_Output=True)
+        self.facets = self.list_facets()
+        return self.facets
+
+    def query(self, query_type: str, solution_number=None):
+        if query_type == "facets":
+            return {"type": query_type, "facets": self.list_facets()}
+        if query_type == "facetCount":
+            return {"type": query_type, "value": self.service.send_command("#?")}
+        if query_type == "facetReduction":
+            return {
+                "type": query_type,
+                "facets": normalize_facets(self.service.send_command("#??")),
+            }
+        if query_type == "solutionCount":
+            return {"type": query_type, "value": self.service.send_command("#!")}
+        if query_type == "solutionReduction":
+            return {
+                "type": query_type,
+                "facets": normalize_facets(self.service.send_command("#!!")),
+            }
+        if query_type == "solution":
+            command = build_solution_command(solution_number)
+            return {"type": query_type, "solutions": normalize_solutions(self.service.send_command(command))}
+        raise ValueError("Unsupported PlanPilot query type.")
+
     def stop(self):
         self.service.stop_fasb()
 
@@ -131,6 +160,38 @@ def normalize_selection_state(selection_state):
     if selection_state == "-":
         return "negative"
     return "neutral"
+
+
+def build_selection_command(facet_id: str, selection_state: str, previous_state=None):
+    if selection_state == "positive":
+        return f"+ {facet_id}"
+    if selection_state == "negative":
+        return f"+ ~{facet_id}"
+    if selection_state == "neutral":
+        if previous_state == "positive":
+            return f"- {facet_id}"
+        if previous_state == "negative":
+            return f"- ~{facet_id}"
+        return None
+    raise ValueError("Unsupported facet selection state.")
+
+
+def build_solution_command(solution_number):
+    if solution_number is None:
+        return "!"
+    if type(solution_number) is int and solution_number > 0:
+        return f"! {solution_number}"
+    raise ValueError("solutionNumber must be a positive integer.")
+
+
+def normalize_solutions(solutions):
+    return [
+        {
+            "label": solution.get("label", ""),
+            "facets": normalize_facets(solution.get("facets", [])),
+        }
+        for solution in solutions
+    ]
 
 
 session_registry = SessionRegistry()

@@ -66,6 +66,53 @@ def list_facets(session_id):
         return planpilot_failed(error)
 
 
+@sessions_bp.route("/sessions/<session_id>/facets/select", methods=["POST"])
+@require_service_auth
+def select_facet(session_id):
+    payload = request.get_json(silent=True)
+    validation_error = validate_select_facet_payload(payload)
+    if validation_error:
+        return invalid_request(validation_error)
+
+    try:
+        session = session_registry.get_session(session_id)
+        facets = session.select_facet(
+            payload["facetId"],
+            payload["selectionState"],
+            payload.get("previousSelectionState"),
+        )
+        return (
+            jsonify({"sessionId": session.session_id, "facets": facets}),
+            200,
+        )
+    except SessionNotFoundError:
+        return session_not_found()
+    except ValueError as error:
+        return invalid_request(str(error))
+    except Exception as error:
+        return planpilot_failed(error)
+
+
+@sessions_bp.route("/sessions/<session_id>/query", methods=["POST"])
+@require_service_auth
+def query_session(session_id):
+    payload = request.get_json(silent=True)
+    validation_error = validate_query_payload(payload)
+    if validation_error:
+        return invalid_request(validation_error)
+
+    try:
+        session = session_registry.get_session(session_id)
+        result = session.query(payload["type"], payload.get("solutionNumber"))
+        return jsonify({"sessionId": session.session_id, "result": result}), 200
+    except SessionNotFoundError:
+        return session_not_found()
+    except ValueError as error:
+        return invalid_request(str(error))
+    except Exception as error:
+        return planpilot_failed(error)
+
+
 @sessions_bp.route("/sessions/<session_id>", methods=["DELETE"])
 @require_service_auth
 def stop_session(session_id):
@@ -109,6 +156,57 @@ def validate_create_session_payload(payload):
     source = payload.get("source")
     if not isinstance(source, dict) or source.get("system") != "IPEXCO":
         return "source.system must be IPEXCO."
+
+    return None
+
+
+def validate_select_facet_payload(payload):
+    if not isinstance(payload, dict):
+        return "Request body must be a JSON object."
+
+    if not is_non_empty_string(payload.get("facetId")):
+        return "facetId is required."
+
+    if payload.get("selectionState") not in {
+        "neutral",
+        "positive",
+        "negative",
+    }:
+        return "selectionState must be neutral, positive, or negative."
+
+    previous_state = payload.get("previousSelectionState")
+    if previous_state is not None and previous_state not in {
+        "neutral",
+        "positive",
+        "negative",
+    }:
+        return "previousSelectionState must be neutral, positive, or negative."
+
+    return None
+
+
+def validate_query_payload(payload):
+    if not isinstance(payload, dict):
+        return "Request body must be a JSON object."
+
+    if payload.get("type") not in {
+        "facets",
+        "facetCount",
+        "facetReduction",
+        "solution",
+        "solutionCount",
+        "solutionReduction",
+    }:
+        return "type must be facets, facetCount, facetReduction, solution, solutionCount, or solutionReduction."
+
+    solution_number = payload.get("solutionNumber")
+    if solution_number is not None and (
+        type(solution_number) is not int or solution_number <= 0
+    ):
+        return "solutionNumber must be a positive integer."
+
+    if payload.get("type") != "solution" and solution_number is not None:
+        return "solutionNumber is only supported for solution queries."
 
     return None
 
