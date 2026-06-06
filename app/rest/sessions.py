@@ -3,6 +3,7 @@ from flask import Blueprint, jsonify, request
 from ..service.session_registry import (
     SUPPORTED_ENCODINGS,
     SessionConfiguration,
+    SessionExpiredError,
     SessionNotFoundError,
     session_registry,
 )
@@ -35,14 +36,26 @@ def create_session():
         return (
             jsonify(
                 {
-                    "sessionId": session.session_id,
-                    "status": "ready",
-                    "configuration": session.configuration.to_response(),
+                    **session.to_response(),
                     "facets": session.facets,
                 }
             ),
             201,
         )
+    except Exception as error:
+        return planpilot_failed(error)
+
+
+@sessions_bp.route("/sessions/<session_id>", methods=["GET"])
+@require_service_auth
+def get_session(session_id):
+    try:
+        session = session_registry.get_session(session_id)
+        return jsonify(session.to_response()), 200
+    except SessionExpiredError:
+        return session_expired()
+    except SessionNotFoundError:
+        return session_not_found()
     except Exception as error:
         return planpilot_failed(error)
 
@@ -60,6 +73,8 @@ def list_facets(session_id):
             jsonify({"sessionId": session.session_id, "facets": session.list_facets()}),
             200,
         )
+    except SessionExpiredError:
+        return session_expired()
     except SessionNotFoundError:
         return session_not_found()
     except Exception as error:
@@ -85,6 +100,8 @@ def select_facet(session_id):
             jsonify({"sessionId": session.session_id, "facets": facets}),
             200,
         )
+    except SessionExpiredError:
+        return session_expired()
     except SessionNotFoundError:
         return session_not_found()
     except ValueError as error:
@@ -105,6 +122,8 @@ def query_session(session_id):
         session = session_registry.get_session(session_id)
         result = session.query(payload["type"], payload.get("solutionNumber"))
         return jsonify({"sessionId": session.session_id, "result": result}), 200
+    except SessionExpiredError:
+        return session_expired()
     except SessionNotFoundError:
         return session_not_found()
     except ValueError as error:
@@ -229,6 +248,10 @@ def invalid_request(message):
 
 def session_not_found():
     return error_response("SESSION_NOT_FOUND", "PlanPilot session was not found.", 404)
+
+
+def session_expired():
+    return error_response("SESSION_EXPIRED", "PlanPilot session has expired.", 410)
 
 
 def planpilot_failed(error):

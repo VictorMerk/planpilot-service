@@ -32,32 +32,30 @@ def parse_facet_output(output: str, command: str) -> List[Dict]:
         return facets
 
     elif command.startswith(("#??", "#!!")):
-        tokens = output.strip().split()
         facets = {}
-        key_to_id = {}
 
-        for i in range(0, len(tokens) - 2, 3):
-            val1_str = tokens[i]
-            val2_str = tokens[i + 1]
-            action_part = tokens[i + 2]
-            match = re.search(
-                r"(occurs(?:_sometime)?\(action\(\(([^)]+)\)\)(?:,(\d+))?\))",
-                action_part,
+        for line in output.strip().splitlines():
+            line = line.strip()
+            if line.startswith("::"):
+                line = line[2:].strip()
+
+            match = re.match(
+                r"([0-9.]+)\s+([0-9.]+)\s+(~?)(occurs(?:_sometime)?\(action\(\(([^)]+)\)\)(?:,(\d+))?\))",
+                line,
             )
             if not match:
                 continue
 
-            full_match, action_str, timestep = match.groups()
+            val1_str, val2_str, negated, full_match, action_str, timestep = match.groups()
             ts = int(timestep) if timestep else 0
             key = (action_str, ts)
 
             if key not in facets:
-                key_to_id[key] = full_match
                 facets[key] = make_facet(action_str, ts, full_match)
 
             facet = facets[key]
             target = "solution" if command == "#!!" else "facets"
-            sign = "negative" if "~" in action_part else "positive"
+            sign = "negative" if negated else "positive"
 
             facet["reduction"][target][sign] = float(val1_str)
             facet["remaining"][target][sign] = float(val2_str)
