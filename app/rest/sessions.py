@@ -1,21 +1,59 @@
-from flask import Blueprint, jsonify, request
+import os
 
+from flask import Blueprint, current_app, jsonify, request
+
+from ..service.fastdownward_service import (
+    FastDownwardCapacityError,
+    FastDownwardNoPlanError,
+    FastDownwardUnsolvableError,
+)
+from ..service.planpilot_service import (
+    PlanpilotCapacityError,
+    PlanpilotNoPlanError,
+    planpilot_max_horizon,
+)
 from ..service.session_registry import (
     SUPPORTED_ENCODINGS,
     SessionConfiguration,
+    SessionCapacityError,
     SessionExpiredError,
     SessionNotFoundError,
+    SessionSelectionConflictError,
     session_registry,
 )
 from .auth import require_service_auth
 
 
 sessions_bp = Blueprint("sessions", __name__)
+MAX_PDDL_BYTES = 1_000_000
 
 
 @sessions_bp.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "ok", "capacity": session_registry.capacity_snapshot()}), 200
+
+
+@sessions_bp.route("/ready", methods=["GET"])
+def ready():
+    capacity = session_registry.capacity_snapshot()
+    api_key_configured = bool(os.environ.get("API_KEY"))
+    is_ready = capacity["acceptingNewSessions"] and api_key_configured
+    status = 200 if is_ready else 503
+    if not api_key_configured:
+        readiness = "misconfigured"
+    elif not capacity["acceptingNewSessions"]:
+        readiness = "at-capacity"
+    else:
+        readiness = "ready"
+    response = jsonify(
+        {
+            "status": readiness,
+            "capacity": capacity,
+        }
+    )
+    if status == 503:
+        response.headers["Retry-After"] = "5"
+    return response, status
 
 
 @sessions_bp.route("/sessions", methods=["POST"])
@@ -32,6 +70,7 @@ def create_session():
             payload["task"]["domainPddl"],
             payload["task"]["problemPddl"],
             configuration,
+            representative_plan=payload.get("representativePlan"),
         )
         return (
             jsonify(
@@ -42,6 +81,14 @@ def create_session():
             ),
             201,
         )
+    except FastDownwardUnsolvableError:
+        return task_unsolvable()
+    except (FastDownwardNoPlanError, PlanpilotNoPlanError):
+        return no_plan()
+    except (FastDownwardCapacityError, PlanpilotCapacityError):
+        return plan_space_too_large()
+    except SessionCapacityError as error:
+        return service_at_capacity(error)
     except Exception as error:
         return planpilot_failed(error)
 
@@ -56,6 +103,8 @@ def get_session(session_id):
         return session_expired()
     except SessionNotFoundError:
         return session_not_found()
+    except PlanpilotCapacityError:
+        return plan_space_too_large()
     except Exception as error:
         return planpilot_failed(error)
 
@@ -69,14 +118,14 @@ def list_facets(session_id):
 
     try:
         session = session_registry.get_session(session_id)
-        return (
-            jsonify({"sessionId": session.session_id, "facets": session.list_facets()}),
-            200,
-        )
+        facets = session.list_facets()
+        return jsonify({**session.to_response(), "facets": facets}), 200
     except SessionExpiredError:
         return session_expired()
     except SessionNotFoundError:
         return session_not_found()
+    except PlanpilotCapacityError:
+        return plan_space_too_large()
     except Exception as error:
         return planpilot_failed(error)
 
@@ -96,16 +145,47 @@ def select_facet(session_id):
             payload["selectionState"],
             payload.get("previousSelectionState"),
         )
-        return (
-            jsonify({"sessionId": session.session_id, "facets": facets}),
-            200,
-        )
+        return jsonify({**session.to_response(), "facets": facets}), 200
     except SessionExpiredError:
         return session_expired()
     except SessionNotFoundError:
         return session_not_found()
+    except SessionSelectionConflictError as error:
+        return selection_conflict(error)
     except ValueError as error:
         return invalid_request(str(error))
+    except PlanpilotNoPlanError:
+        return no_plan(status=409)
+    except PlanpilotCapacityError:
+        return plan_space_too_large()
+    except Exception as error:
+        return planpilot_failed(error)
+
+
+@sessions_bp.route("/sessions/<session_id>/facets/apply", methods=["POST"])
+@require_service_auth
+def apply_facets(session_id):
+    payload = request.get_json(silent=True)
+    validation_error = validate_apply_facets_payload(payload)
+    if validation_error:
+        return invalid_request(validation_error)
+
+    try:
+        session = session_registry.get_session(session_id)
+        facets = session.apply_selections(payload["selections"])
+        return jsonify({**session.to_response(), "facets": facets}), 200
+    except SessionExpiredError:
+        return session_expired()
+    except SessionNotFoundError:
+        return session_not_found()
+    except SessionSelectionConflictError as error:
+        return selection_conflict(error)
+    except ValueError as error:
+        return invalid_request(str(error))
+    except PlanpilotNoPlanError:
+        return no_plan(status=409)
+    except PlanpilotCapacityError:
+        return plan_space_too_large()
     except Exception as error:
         return planpilot_failed(error)
 
@@ -121,13 +201,15 @@ def query_session(session_id):
     try:
         session = session_registry.get_session(session_id)
         result = session.query(payload["type"], payload.get("solutionNumber"))
-        return jsonify({"sessionId": session.session_id, "result": result}), 200
+        return jsonify({**session.to_response(), "result": result}), 200
     except SessionExpiredError:
         return session_expired()
     except SessionNotFoundError:
         return session_not_found()
     except ValueError as error:
         return invalid_request(str(error))
+    except PlanpilotCapacityError:
+        return plan_space_too_large()
     except Exception as error:
         return planpilot_failed(error)
 
@@ -158,6 +240,12 @@ def validate_create_session_payload(payload):
     if not is_non_empty_string(task.get("problemPddl")):
         return "task.problemPddl is required."
 
+    if len(task["domainPddl"].encode("utf-8")) > MAX_PDDL_BYTES:
+        return "task.domainPddl is too large."
+
+    if len(task["problemPddl"].encode("utf-8")) > MAX_PDDL_BYTES:
+        return "task.problemPddl is too large."
+
     configuration = payload.get("configuration")
     if not isinstance(configuration, dict):
         return "configuration is required."
@@ -165,6 +253,11 @@ def validate_create_session_payload(payload):
     horizon = configuration.get("horizon")
     if type(horizon) is not int or horizon <= 0:
         return "configuration.horizon must be a positive integer."
+    if horizon > planpilot_max_horizon():
+        return (
+            "configuration.horizon must not exceed "
+            f"{planpilot_max_horizon()}."
+        )
 
     if configuration.get("encoding") not in SUPPORTED_ENCODINGS:
         return "configuration.encoding must be exact or bounded."
@@ -176,7 +269,37 @@ def validate_create_session_payload(payload):
     if not isinstance(source, dict) or source.get("system") != "IPEXCO":
         return "source.system must be IPEXCO."
 
+    representative_plan = payload.get("representativePlan")
+    if representative_plan is not None:
+        if not isinstance(representative_plan, list) or not representative_plan:
+            return "representativePlan must be a non-empty array when provided."
+        if len(representative_plan) > horizon:
+            return "representativePlan must not contain more actions than the configured horizon."
+        for index, action in enumerate(representative_plan):
+            if not isinstance(action, dict):
+                return f"representativePlan[{index}] must be an object."
+            if set(action) != {"name", "params"}:
+                return f"representativePlan[{index}] must contain only name and params."
+            if not is_pddl_token(action.get("name")):
+                return f"representativePlan[{index}].name must be a PDDL token."
+            params = action.get("params")
+            if not isinstance(params, list) or not all(is_pddl_token(value) for value in params):
+                return f"representativePlan[{index}].params must contain only PDDL tokens."
+        if (
+            configuration.get("encoding") == "exact"
+            and len(representative_plan) != horizon
+        ):
+            return "representativePlan must fill the configured horizon in exact mode."
+
     return None
+
+
+def is_pddl_token(value):
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and not any(character.isspace() or character in "()" for character in value)
+    )
 
 
 def validate_select_facet_payload(payload):
@@ -201,6 +324,26 @@ def validate_select_facet_payload(payload):
     }:
         return "previousSelectionState must be neutral, positive, or negative."
 
+    return None
+
+
+def validate_apply_facets_payload(payload):
+    if not isinstance(payload, dict):
+        return "Request body must be a JSON object."
+    selections = payload.get("selections")
+    if not isinstance(selections, list) or not selections:
+        return "selections must be a non-empty array."
+    if len(selections) > 50:
+        return "At most 50 facet selections can be applied at once."
+    seen_ids = set()
+    for selection in selections:
+        error = validate_select_facet_payload(selection)
+        if error:
+            return error
+        facet_id = selection["facetId"]
+        if facet_id in seen_ids:
+            return "Each facetId may occur only once."
+        seen_ids.add(facet_id)
     return None
 
 
@@ -254,8 +397,42 @@ def session_expired():
     return error_response("SESSION_EXPIRED", "PlanPilot session has expired.", 410)
 
 
+def selection_conflict(error):
+    return error_response("SELECTION_CONFLICT", str(error), 409)
+
+
+def task_unsolvable():
+    return error_response(
+        "TASK_UNSOLVABLE",
+        "Fast Downward proved that the planning task is unsatisfiable.",
+        422,
+    )
+
+
+def no_plan(status=422):
+    return error_response(
+        "NO_PLAN",
+        "No non-empty plan exists for the requested PlanPilot configuration.",
+        status,
+    )
+
+
+def plan_space_too_large():
+    return error_response(
+        "PLAN_SPACE_TOO_LARGE",
+        "PlanPilot did not finish in time. Try a smaller horizon or exact mode at the plan length.",
+        503,
+    )
+
+
+def service_at_capacity(error):
+    response, status = error_response(error.code, str(error), 503)
+    response.headers["Retry-After"] = "5"
+    return response, status
+
+
 def planpilot_failed(error):
-    print(f"PlanPilot session request failed: {error}")
+    current_app.logger.exception("PlanPilot session request failed: %s", error)
     return error_response(
         "PLANPILOT_FAILED", "PlanPilot failed to process the session request.", 500
     )
