@@ -102,6 +102,13 @@ class SessionContext:
                 "type": query_type,
                 "solutions": normalize_solutions(self.service.send_command(command)),
             }
+        if query_type == "impliedFacets":
+            # '|= %' returns the facets entailed by the current decisions, i.e.
+            # the landmarks that hold in every remaining solution.
+            return {
+                "type": query_type,
+                "facets": normalize_facets(self.service.send_command("|= %")),
+            }
         raise ValueError("Unsupported PlanPilot query type.")
 
     def stop(self):

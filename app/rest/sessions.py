@@ -215,8 +215,9 @@ def validate_query_payload(payload):
         "solution",
         "solutionCount",
         "solutionReduction",
+        "impliedFacets",
     }:
-        return "type must be facets, facetCount, facetReduction, solution, solutionCount, or solutionReduction."
+        return "type must be facets, facetCount, facetReduction, solution, solutionCount, solutionReduction, or impliedFacets."
 
     solution_number = payload.get("solutionNumber")
     if solution_number is not None and (
