@@ -230,6 +230,16 @@ class SessionRegistry:
             BytesIO(problem_pddl.encode("utf-8")),
         )
 
+        # The IPEXCO frontend may request a horizon below the shortest plan
+        # length; raise it so the session always contains at least one plan.
+        plan_length = artifacts.get("horizon") or None
+        if plan_length and configuration.horizon < plan_length:
+            configuration = SessionConfiguration(
+                horizon=plan_length,
+                encoding=configuration.encoding,
+                abstract_time_steps=configuration.abstract_time_steps,
+            )
+
         service = PlanpilotService()
         try:
             facets = service.run_planpilot_service(
@@ -247,7 +257,7 @@ class SessionRegistry:
             configuration=configuration,
             service=service,
             facets=normalize_facets(facets),
-            min_horizon=artifacts.get("horizon") or None,
+            min_horizon=plan_length,
         )
 
         with self._lock:
