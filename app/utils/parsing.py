@@ -1,6 +1,14 @@
 import re
 from typing import Dict, List
 
+# Action atoms: occurs(action(("...")),T) / occurs_sometime(action(("...")))
+OCCURS_PATTERN = r"(occurs(?:_sometime)?\(action\(\(([^)]+)\)\)(?:,(\d+))?\))"
+# State atoms: holds(variable(V), value("pred(args)", true|false), T)
+HOLDS_PATTERN = (
+    r'(holds\(variable\((?:\d+|"[^"]*")\),\s*'
+    r'value\("([^"]+)",\s*(true|false)\),\s*(\d+)\))'
+)
+
 
 def parse_facet_output(output: str, command: str) -> List[Dict]:
     def make_facet(action_str, timestep, raw_id):
@@ -22,13 +30,37 @@ def parse_facet_output(output: str, command: str) -> List[Dict]:
             "selectionState": "Not selected",
         }
 
+    def make_holds_facet(value_str, truth, timestep, raw_id):
+        # The whole predicate (e.g. 'on(a,b)') is the label; negated values
+        # are prefixed so 'clear(a)' and '¬clear(a)' stay distinguishable.
+        # String constants arrive space-free (see _generate_lp_with_plasp),
+        # so re-insert a space after commas for readability.
+        label = value_str.replace(",", ", ")
+        label = label if truth == "true" else f"¬{label}"
+        return {
+            "id": raw_id,
+            "action": label,
+            "constant1": None,
+            "constant2": None,
+            "timestep": int(timestep),
+            "reduction": {
+                "solution": {"positive": None, "negative": None},
+                "facets": {"positive": None, "negative": None},
+            },
+            "remaining": {
+                "solution": {"positive": None, "negative": None},
+                "facets": {"positive": None, "negative": None},
+            },
+            "selectionState": "Not selected",
+        }
+
     if command.startswith(("?", "|= %", "+", "-")):
         facets = []
-        pattern = r"(occurs(?:_sometime)?\(action\(\(([^)]+)\)\)(?:,(\d+))?\))"
-        matches = re.findall(pattern, output)
-        for full_match, action_str, timestep in matches:
+        for full_match, action_str, timestep in re.findall(OCCURS_PATTERN, output):
             ts = int(timestep) if timestep else 0
             facets.append(make_facet(action_str, ts, full_match))
+        for full_match, value_str, truth, timestep in re.findall(HOLDS_PATTERN, output):
+            facets.append(make_holds_facet(value_str, truth, timestep, full_match))
         return facets
 
     elif command.startswith(("#??", "#!!")):
@@ -40,18 +72,26 @@ def parse_facet_output(output: str, command: str) -> List[Dict]:
                 line = line[2:].strip()
 
             match = re.match(
-                r"([0-9.]+)\s+([0-9.]+)\s+(~?)(occurs(?:_sometime)?\(action\(\(([^)]+)\)\)(?:,(\d+))?\))",
+                r"([0-9.]+)\s+([0-9.]+)\s+(~?)" + OCCURS_PATTERN,
                 line,
             )
-            if not match:
-                continue
-
-            val1_str, val2_str, negated, full_match, action_str, timestep = match.groups()
-            ts = int(timestep) if timestep else 0
-            key = (action_str, ts)
-
-            if key not in facets:
-                facets[key] = make_facet(action_str, ts, full_match)
+            if match:
+                val1_str, val2_str, negated, full_match, action_str, timestep = match.groups()
+                ts = int(timestep) if timestep else 0
+                key = (action_str, ts)
+                if key not in facets:
+                    facets[key] = make_facet(action_str, ts, full_match)
+            else:
+                match = re.match(
+                    r"([0-9.]+)\s+([0-9.]+)\s+(~?)" + HOLDS_PATTERN,
+                    line,
+                )
+                if not match:
+                    continue
+                val1_str, val2_str, negated, full_match, value_str, truth, timestep = match.groups()
+                key = full_match
+                if key not in facets:
+                    facets[key] = make_holds_facet(value_str, truth, timestep, full_match)
 
             facet = facets[key]
             target = "solution" if command == "#!!" else "facets"

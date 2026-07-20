@@ -552,6 +552,19 @@ class PlanpilotService:
         if result.returncode != 0:
             raise RuntimeError(f"plasp failed:\n{result.stderr}")
 
+        # fasb tokenizes selection commands on whitespace, so an atom like
+        # holds(_, value("on(b, c)", true), _) cannot be activated — the space
+        # inside the string constant splits it into two unparseable tokens.
+        # Removing spaces inside every quoted string constant is a global,
+        # consistent renaming and keeps the program equivalent.
+        with open(lp_output_path, "r") as lp_file:
+            program = lp_file.read()
+        program = re.sub(
+            r'"[^"]*"', lambda match: match.group(0).replace(" ", ""), program
+        )
+        with open(lp_output_path, "w") as lp_file:
+            lp_file.write(program)
+
     def _terminate_process(self, proc: subprocess.Popen):
         if proc.poll() is None:  # process is still running
             try:
