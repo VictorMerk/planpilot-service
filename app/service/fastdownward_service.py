@@ -11,15 +11,15 @@ _task_locks_guard = threading.Lock()
 
 
 class FastDownwardNoPlanError(RuntimeError):
-    """Fast Downward completed without producing a usable plan."""
+    pass
 
 
 class FastDownwardUnsolvableError(FastDownwardNoPlanError):
-    """Fast Downward proved that the planning task is unsatisfiable."""
+    pass
 
 
 class FastDownwardCapacityError(RuntimeError):
-    """Task preparation exceeded the service's bounded runtime."""
+    pass
 
 
 def run_fastdownward_service(domain_file, problem_file, representative_plan=None):
@@ -75,9 +75,7 @@ def _run_fastdownward_for_hash(
                     "The cached Fast Downward translation is missing."
                 )
             if representative_plan is not None:
-                # A caller-supplied plan is request data, not a cache artifact.  In
-                # particular, never overwrite the shared Fast Downward plan for
-                # another session with it.
+                # The supplied plan determines the horizon, even with a cached SAS file.
                 horizon = len(representative_plan)
             else:
                 if not existing_request.plan_file_path:
@@ -145,19 +143,17 @@ def _run_fastdownward_for_hash(
         raise FastDownwardUnsolvableError(
             "Fast Downward proved that the planning task is unsatisfiable."
         )
-    if result.returncode == 12:
-        raise FastDownwardNoPlanError(
-            "Fast Downward completed without finding a plan."
+    if result.returncode == 12 or result.returncode in {20, 21, 22, 23, 24}:
+        raise FastDownwardCapacityError(
+            "Fast Downward stopped before it could finish the search."
         )
-    if result.returncode != 0:
+    if result.returncode not in {0, 1, 2, 3}:
         diagnostic = (result.stderr or result.stdout or "no diagnostic output").strip()
         raise RuntimeError(
             f"Fast Downward execution failed with exit code {result.returncode}: "
             f"{diagnostic}"
         )
 
-    # Translation always needs SAS. A plan file is required only when Fast
-    # Downward performed the search itself.
     horizon = (
         len(representative_plan)
         if representative_plan is not None

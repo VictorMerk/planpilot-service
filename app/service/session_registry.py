@@ -4,14 +4,28 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from threading import BoundedSemaphore, Event, RLock, Thread
+from time import monotonic
 from typing import Dict, List, Optional
 from uuid import uuid4
 
 from .fastdownward_service import run_fastdownward_service
+from .session_contract import (
+    build_selection_command,
+    build_solution_command,
+    is_abstract_facet,
+    normalize_count,
+    normalize_facet,
+    normalize_facets,
+    normalize_implied_facets,
+    normalize_solution,
+    normalize_solutions,
+)
 from .planpilot_service import (
     PlanpilotCapacityError,
     PlanpilotNoPlanError,
     PlanpilotService,
+    fasb_impact_timeout_seconds,
+    planpilot_max_horizon,
 )
 SUPPORTED_ENCODINGS = {"exact", "bounded"}
 
@@ -32,10 +46,27 @@ class SessionSelectionConflictError(RuntimeError):
         )
 
 
+class SessionRevisionConflictError(RuntimeError):
+    def __init__(self, expected_revision, actual_revision):
+        super().__init__(
+            f"Session revision {expected_revision} is stale; "
+            f"the current revision is {actual_revision}. Refresh and retry."
+        )
+
+
 class SessionCapacityError(RuntimeError):
     def __init__(self, code, message):
         super().__init__(message)
         self.code = code
+
+
+class SessionHorizonError(ValueError):
+    def __init__(self, minimum_horizon, maximum_horizon):
+        super().__init__(
+            f"The shortest plan has {minimum_horizon} actions, but PlanPilot supports at most {maximum_horizon}."
+        )
+        self.minimum_horizon = minimum_horizon
+        self.maximum_horizon = maximum_horizon
 
 
 @dataclass(frozen=True)
@@ -61,10 +92,13 @@ class SessionContext:
     facet_timesteps: Dict[str, Optional[int]]
     solution: Optional[Dict] = None
     baseline_solution: Optional[Dict] = None
+    solution_count: Optional[int] = None
     solution_cache: Dict[int, Dict] = field(default_factory=dict)
     minimum_horizon: Optional[int] = None
     applied_selections: Dict[str, str] = field(default_factory=dict)
     facet_catalog: Dict[str, Dict] = field(default_factory=dict)
+    selection_revision: int = 0
+    solver_available: bool = True
     created_at: datetime = field(default_factory=lambda: utc_now())
     last_access_at: datetime = field(default_factory=lambda: utc_now())
     expires_at: datetime = field(default_factory=lambda: utc_now() + session_ttl())
@@ -84,7 +118,9 @@ class SessionContext:
             "status": "ready",
             "hasPlan": solution is not None and bool(solution["facets"]),
             "solution": solution,
+            "solutionCount": self.solution_count,
             "minimumHorizon": self.minimum_horizon,
+            "selectionRevision": self.selection_revision,
             "configuration": self.configuration.to_response(),
             "createdAt": to_iso(self.created_at),
             "lastAccessAt": to_iso(self.last_access_at),
@@ -101,57 +137,108 @@ class SessionContext:
                 self._restore_solver_process()
                 raise
 
-    def select_facet(self, facet_id: str, selection_state: str, previous_state=None):
+    def list_facets_response(self):
+        with self.operation_lock:
+            facets = self.list_facets()
+            return {**self.to_response(), "facets": facets}
+
+    def select_facet(
+        self,
+        facet_id: str,
+        selection_state: str,
+        previous_state=None,
+        expected_revision=None,
+    ):
         selection = {"facetId": facet_id, "selectionState": selection_state}
         if previous_state is not None:
             selection["previousSelectionState"] = previous_state
-        return self.apply_selections([selection])
+        return self.apply_selections([selection], expected_revision)
 
-    def apply_selections(self, selections):
+    def apply_selections(self, selections, expected_revision=None):
         with self.operation_lock:
+            if (
+                expected_revision is not None
+                and expected_revision != self.selection_revision
+            ):
+                raise SessionRevisionConflictError(
+                    expected_revision,
+                    self.selection_revision,
+                )
             for selection in selections:
                 facet_id = selection["facetId"]
                 if facet_id not in self.facet_timesteps:
                     raise ValueError(f"Facet '{facet_id}' is not part of this session.")
+                visible_facet = next(
+                    (facet for facet in self.facets if facet.get("id") == facet_id),
+                    None,
+                )
+                if visible_facet is not None and visible_facet.get("selectable") is False:
+                    raise ValueError(f"Facet '{facet_id}' is not selectable.")
             self._validate_previous_selection_states(selections)
-            next_selections = dict(self.applied_selections)
-            for selection in selections:
-                facet_id = selection["facetId"]
-                state = selection["selectionState"]
-                if state == "neutral":
-                    next_selections.pop(facet_id, None)
-                else:
-                    if state == "positive":
-                        timestep = self.facet_timesteps[facet_id]
-                        if timestep is not None:
-                            for active_id, active_state in list(next_selections.items()):
-                                if (
-                                    active_id != facet_id
-                                    and active_state == "positive"
-                                    and self.facet_timesteps[active_id] == timestep
-                                ):
-                                    next_selections.pop(active_id)
-                    next_selections[facet_id] = state
+            next_selections = self._updated_selections(
+                self.applied_selections,
+                selections,
+            )
 
             previous_selections = dict(self.applied_selections)
+            previous_solution = self.solution
+            previous_solution_count = self.solution_count
+            previous_facets = self.facets
+            previous_solution_cache = dict(self.solution_cache)
+            previous_facet_catalog = dict(self.facet_catalog)
+            previous_facet_timesteps = dict(self.facet_timesteps)
+            previous_selection_revision = self.selection_revision
             try:
                 solution = self._rebuild_with_selections(next_selections)
                 self.applied_selections = next_selections
-            except Exception:
-                self.solution = self._rebuild_with_selections(previous_selections)
-                raise
-
-            self.solution = solution
-            self.solution_cache = {}
-            try:
-                self.facets = self._compose_facets(
+                facets = self._compose_facets(
                     self._read_current_facets(),
-                    self.solution,
+                    solution,
                 )
-            except PlanpilotCapacityError:
+                self.solution = solution
+                self.solution_count = None
+                self.solution_cache = {}
+                self.facets = facets
+                self.selection_revision += 1
+                response = {
+                    **self.to_response(),
+                    "solutionCount": None,
+                    "facets": self.facets,
+                }
+            except Exception:
+                self.applied_selections = previous_selections
+                self.solution = previous_solution
+                self.solution_count = previous_solution_count
+                self.facets = previous_facets
+                self.solution_cache = previous_solution_cache
+                self.facet_catalog = previous_facet_catalog
+                self.facet_timesteps = previous_facet_timesteps
+                self.selection_revision = previous_selection_revision
                 self._restore_solver_process()
                 raise
-            return self.facets
+
+            return response
+
+    def _updated_selections(self, current, selections):
+        updated = dict(current)
+        for selection in selections:
+            facet_id = selection["facetId"]
+            state = selection["selectionState"]
+            if state == "neutral":
+                updated.pop(facet_id, None)
+                continue
+            if state == "positive":
+                timestep = self.facet_timesteps[facet_id]
+                if timestep is not None:
+                    for active_id, active_state in list(updated.items()):
+                        if (
+                            active_id != facet_id
+                            and active_state == "positive"
+                            and self.facet_timesteps[active_id] == timestep
+                        ):
+                            updated.pop(active_id)
+            updated[facet_id] = state
+        return updated
 
     def _validate_previous_selection_states(self, selections):
         for selection in selections:
@@ -175,7 +262,7 @@ class SessionContext:
             if implied.get("id") in known_ids or not is_abstract_facet(implied):
                 continue
             implied_facet = dict(implied)
-            implied_facet["selectionState"] = "+"
+            implied_facet["selectionState"] = "neutral"
             implied_facet["_facetType"] = "implied"
             facets.append(implied_facet)
         return facets
@@ -249,9 +336,8 @@ class SessionContext:
 
     def _remember_facet_timesteps(self, facets):
         for facet in facets:
-            timestep = facet.get("timestep")
-            if facet.get("id") and timestep is not None:
-                self.facet_timesteps[facet["id"]] = timestep
+            if facet.get("id"):
+                self.facet_timesteps[facet["id"]] = facet.get("timestep")
 
     def _rebuild_with_selections(self, selections):
         self.service.restart_FASB()
@@ -259,26 +345,37 @@ class SessionContext:
             command = build_selection_command(facet_id, selection_state)
             self.service.send_command(command, no_Output=True)
 
-        if normalize_count(self.service.send_command("#!")) == 0:
-            raise PlanpilotNoPlanError(
-                "The facet selection leaves no non-empty plan."
-            )
-
         if not selections and self.baseline_solution:
             return self.baseline_solution
         return self.service.get_representative_solution(required=True)
 
-    def _restore_solver_process(self):
+    def _restore_solver_process(self, timeout_seconds=None, raise_on_failure=False):
         """Restart FASB and restore active selections after a timeout."""
         try:
-            self.service.restart_FASB()
+            deadline = (
+                monotonic() + timeout_seconds
+                if timeout_seconds is not None
+                else None
+            )
+            self._restart_solver(deadline)
             for facet_id, selection_state in sorted(self.applied_selections.items()):
                 command = build_selection_command(facet_id, selection_state)
-                self.service.send_command(command, no_Output=True)
+                if deadline is None:
+                    self.service.send_command(command, no_Output=True)
+                else:
+                    self.service.send_command(
+                        command,
+                        no_Output=True,
+                        timeout_seconds=self._remaining_time(deadline),
+                    )
+            self.solver_available = True
         except Exception:
+            self.solver_available = False
             self.service.stop_fasb()
+            if raise_on_failure:
+                raise
 
-    def query(self, query_type: str, solution_number=None):
+    def query(self, query_type: str, solution_number=None, facet_id=None):
         with self.operation_lock:
             if query_type == "facets":
                 return {"type": query_type, "facets": self.list_facets()}
@@ -295,10 +392,24 @@ class SessionContext:
                         "type": query_type,
                         "facets": normalize_facets(self.service.send_command("#??")),
                     }
-                if query_type == "solutionCount":
+                if query_type == "impliedFacets":
                     return {
                         "type": query_type,
-                        "value": normalize_count(self.service.send_command("#!")),
+                        "facets": normalize_implied_facets(
+                            self.service.send_command("|= %")
+                        ),
+                    }
+                if query_type == "solutionCount":
+                    if self.solution_count is None:
+                        count = normalize_count(self.service.send_command("#!"))
+                        if count == 0 and self.solution:
+                            raise PlanpilotNoPlanError(
+                                "The solver count contradicts the current plan."
+                            )
+                        self.solution_count = count
+                    return {
+                        "type": query_type,
+                        "value": self.solution_count,
                     }
                 if query_type == "solutionReduction":
                     if normalize_count(self.service.send_command("#?")) == 0:
@@ -307,37 +418,182 @@ class SessionContext:
                         "type": query_type,
                         "facets": normalize_facets(self.service.send_command("#!!")),
                     }
+                if query_type == "selectionImpact":
+                    return self._selection_impact(facet_id)
                 if query_type == "solution":
-                    # Solution 1 is the graph snapshot created with the session.
-                    if solution_number == 1 and self.solution:
-                        return {
-                            "type": query_type,
-                            "solutions": [normalize_solution(self.solution)],
-                        }
                     if solution_number is not None and solution_number in self.solution_cache:
                         return {
                             "type": query_type,
                             "solutions": [self.solution_cache[solution_number]],
                         }
+                    if (
+                        solution_number is not None
+                        and self.solution_count is not None
+                        and solution_number > self.solution_count
+                    ):
+                        return {"type": query_type, "solutions": []}
                     command = build_solution_command(solution_number)
                     solutions = normalize_solutions(self.service.send_command(command))
                     if solution_number is not None:
+                        if len(solutions) < solution_number and solutions:
+                            self.solution_count = len(solutions)
+                        for solution in solutions:
+                            label = solution.get("label", "")
+                            prefix = "solution "
+                            if not label.startswith(prefix):
+                                continue
+                            try:
+                                cached_number = int(label[len(prefix):])
+                            except ValueError:
+                                continue
+                            if cached_number > 0:
+                                self.solution_cache[cached_number] = solution
                         expected_label = f"solution {solution_number}"
-                        requested = next(
-                            (solution for solution in solutions if solution["label"] == expected_label),
-                            None,
-                        )
+                        requested = self.solution_cache.get(solution_number)
+                        if requested is None:
+                            requested = next(
+                                (
+                                    solution
+                                    for solution in solutions
+                                    if solution["label"] == expected_label
+                                ),
+                                None,
+                            )
                         solutions = [requested] if requested else []
-                        if requested:
-                            self.solution_cache[solution_number] = requested
                     return {
                         "type": query_type,
                         "solutions": solutions,
                     }
                 raise ValueError("Unsupported PlanPilot query type.")
             except PlanpilotCapacityError:
-                self._restore_solver_process()
+                if query_type != "selectionImpact":
+                    self._restore_solver_process()
                 raise
+
+    def _selection_impact(self, facet_id):
+        if facet_id not in self.facet_timesteps:
+            raise ValueError(f"Facet '{facet_id}' is not part of this session.")
+        visible = next(
+            (facet for facet in self.facets if facet.get("id") == facet_id),
+            None,
+        )
+        if visible is None or visible.get("selectable") is False:
+            raise ValueError(f"Facet '{facet_id}' is not selectable.")
+
+        require_route = self._updated_selections(
+            self.applied_selections,
+            [{"facetId": facet_id, "selectionState": "positive"}],
+        )
+        forbid_route = self._updated_selections(
+            self.applied_selections,
+            [{"facetId": facet_id, "selectionState": "negative"}],
+        )
+        competing_required = any(
+            active_id != facet_id
+            and state == "positive"
+            and self.facet_timesteps.get(active_id) is not None
+            and self.facet_timesteps.get(active_id) == self.facet_timesteps.get(facet_id)
+            for active_id, state in self.applied_selections.items()
+        )
+        comparable = (
+            facet_id not in self.applied_selections
+            and not competing_required
+        )
+
+        restore_error = None
+        try:
+            require_count = self._count_route(require_route)
+            forbid_count = self._count_route(forbid_route)
+            total = require_count + forbid_count if comparable else None
+            if total is not None and total > 0:
+                self.solution_count = total
+            return {
+                "type": "selectionImpact",
+                "facetId": facet_id,
+                "exact": True,
+                "comparableToCurrent": comparable,
+                "totalPlans": total,
+                "require": impact_direction(require_count, total),
+                "forbid": impact_direction(forbid_count, total),
+            }
+        except PlanpilotCapacityError:
+            require_available = self._route_has_plan(require_route)
+            forbid_available = self._route_has_plan(forbid_route)
+            return {
+                "type": "selectionImpact",
+                "facetId": facet_id,
+                "exact": False,
+                "comparableToCurrent": comparable,
+                "totalPlans": self.solution_count if comparable else None,
+                "require": availability_direction(require_available),
+                "forbid": availability_direction(forbid_available),
+            }
+        finally:
+            try:
+                self._restore_solver_process(
+                    timeout_seconds=fasb_impact_timeout_seconds(),
+                    raise_on_failure=True,
+                )
+            except Exception as error:
+                restore_error = error
+            if restore_error is not None:
+                raise PlanpilotCapacityError(
+                    "PlanPilot could not restore the current plan space after the preview."
+                ) from restore_error
+
+    def _count_route(self, selections):
+        deadline = monotonic() + fasb_impact_timeout_seconds()
+        self._restart_solver(deadline)
+        for facet_id, selection_state in sorted(selections.items()):
+            self.service.send_command(
+                build_selection_command(facet_id, selection_state),
+                no_Output=True,
+                timeout_seconds=self._remaining_time(deadline),
+            )
+        return normalize_count(
+            self.service.send_command(
+                "#!",
+                timeout_seconds=self._remaining_time(deadline),
+            )
+        )
+
+    def _route_has_plan(self, selections):
+        deadline = monotonic() + fasb_impact_timeout_seconds()
+        self._restart_solver(deadline)
+        for facet_id, selection_state in sorted(selections.items()):
+            self.service.send_command(
+                build_selection_command(facet_id, selection_state),
+                no_Output=True,
+                timeout_seconds=self._remaining_time(deadline),
+            )
+        return (
+            self.service.get_representative_solution(
+                required=False,
+                timeout_seconds=self._remaining_time(deadline),
+            )
+            is not None
+        )
+
+    def _restart_solver(self, deadline):
+        timeout_seconds = self._remaining_time(deadline)
+        if timeout_seconds is None:
+            self.service.restart_FASB()
+        else:
+            self.service.restart_FASB(timeout_seconds=timeout_seconds)
+
+    @staticmethod
+    def _remaining_time(deadline):
+        if deadline is None:
+            return None
+        remaining = deadline - monotonic()
+        if remaining <= 0.1:
+            raise PlanpilotCapacityError("PlanPilot impact preview timed out.")
+        return remaining
+
+    def query_response(self, query_type: str, solution_number=None, facet_id=None):
+        with self.operation_lock:
+            result = self.query(query_type, solution_number, facet_id)
+            return {**self.to_response(), "result": result}
 
     def stop(self):
         with self.operation_lock:
@@ -387,6 +643,17 @@ class SessionRegistry:
                 BytesIO(problem_pddl.encode("utf-8")),
                 representative_plan=representative_plan,
             )
+            if representative_plan is None and artifacts["horizon"] > planpilot_max_horizon():
+                raise SessionHorizonError(
+                    artifacts["horizon"],
+                    planpilot_max_horizon(),
+                )
+            if representative_plan is None and artifacts["horizon"] > configuration.horizon:
+                configuration = SessionConfiguration(
+                    artifacts["horizon"],
+                    configuration.encoding,
+                    configuration.abstract_time_steps,
+                )
 
             service = PlanpilotService()
             try:
@@ -396,24 +663,15 @@ class SessionRegistry:
                     configuration.encoding,
                     configuration.abstract_time_steps,
                 )
-                solution_count = normalize_count(service.send_command("#!"))
-                if solution_count == 0:
-                    raise PlanpilotNoPlanError(
-                        "PlanPilot found no non-empty plan for the requested horizon and encoding."
-                    )
                 solver_solution = service.get_representative_solution(required=True)
-                initial_solution = (
-                    solution_from_representative_plan(representative_plan)
-                    if representative_plan
-                    else solver_solution
-                )
+                initial_solution = solver_solution
                 if configuration.abstract_time_steps:
                     known_ids = {facet.get("id") for facet in initial_facets}
                     for implied in service.send_command("|= %") or []:
                         if implied.get("id") in known_ids or not is_abstract_facet(implied):
                             continue
                         implied_facet = dict(implied)
-                        implied_facet["selectionState"] = "+"
+                        implied_facet["selectionState"] = "neutral"
                         implied_facet["_facetType"] = "implied"
                         initial_facets.append(implied_facet)
             except Exception:
@@ -455,7 +713,6 @@ class SessionRegistry:
                 raise self._session_limit_error()
 
     def _register_session(self, session):
-        """Register a session if capacity is still available."""
         with self._lock:
             self._cleanup_expired_locked()
             if len(self._sessions) >= self._max_active_sessions:
@@ -488,6 +745,9 @@ class SessionRegistry:
         with self._lock:
             self._cleanup_expired_locked(exclude_session_id=session_id)
             session = self._sessions.get(session_id)
+            if session and not session.solver_available:
+                self._sessions.pop(session_id, None)
+                raise SessionNotFoundError(session_id)
             if session and session.is_expired():
                 self._sessions.pop(session_id, None)
                 session.stop()
@@ -530,150 +790,30 @@ class SessionRegistry:
         expired_ids = [
             session_id
             for session_id, session in self._sessions.items()
-            if session_id != exclude_session_id and session.is_expired()
+            if session_id != exclude_session_id
+            and (session.is_expired() or not session.solver_available)
         ]
         for session_id in expired_ids:
             session = self._sessions.pop(session_id)
             session.stop()
 
 
-def normalize_facets(facets):
-    return [normalize_facet(facet) for facet in facets]
-
-
-def normalize_facet(
-    facet,
-    facet_type=None,
-    parent_id=None,
-):
-    action_name = facet.get("action", "")
-    arguments = facet.get("arguments")
-    if arguments is None:
-        arguments = [
-            constant
-            for constant in [facet.get("constant1"), facet.get("constant2")]
-            if constant
-        ]
-    label = " ".join([action_name, *arguments]).strip()
-    abstract_time_step = is_abstract_facet(facet)
-    facet_timestep = None if abstract_time_step else facet.get("timestep")
-
-    normalized = {
-        "id": facet["id"],
-        "label": label or facet["id"],
-        "timestep": facet_timestep if facet_timestep else None,
-        "selectionState": normalize_selection_state(facet.get("selectionState")),
-        "action": {"name": action_name, "arguments": list(arguments)},
+def impact_direction(remaining, total):
+    reduction = None
+    if total:
+        reduction = (total - remaining) / total
+    return {
+        "available": remaining > 0,
+        "plansRemaining": remaining,
+        "planReduction": reduction,
     }
 
-    if facet_type:
-        normalized["facetType"] = facet_type
-    if abstract_time_step:
-        normalized["abstractTimeStep"] = True
-    if parent_id:
-        normalized["parentId"] = parent_id
-    if facet.get("reduction") is not None:
-        normalized["reduction"] = facet["reduction"]
-    if facet.get("remaining") is not None:
-        normalized["remaining"] = facet["remaining"]
 
-    return normalized
-
-
-def is_abstract_facet(facet):
-    return facet.get("id", "").startswith("occurs_sometime(")
-
-
-def normalize_count(value):
-    if isinstance(value, int):
-        return value
-    if not isinstance(value, str):
-        raise ValueError("FASB returned no numeric count.")
-    for line in reversed(value.splitlines()):
-        stripped = line.strip()
-        while stripped.startswith("::"):
-            stripped = stripped[2:].strip()
-        if stripped.isdecimal():
-            return int(stripped)
-    if not value.strip():
-        raise ValueError("FASB returned no numeric count.")
-    raise ValueError(f"FASB returned an invalid count: {value!r}")
-
-
-def normalize_selection_state(selection_state):
-    if selection_state == "+":
-        return "positive"
-    if selection_state == "-":
-        return "negative"
-    return "neutral"
-
-
-def build_selection_command(facet_id: str, selection_state: str):
-    if selection_state == "positive":
-        return f"+ {facet_id}"
-    if selection_state == "negative":
-        return f"+ ~{facet_id}"
-    raise ValueError("Unsupported facet selection state.")
-
-
-def build_solution_command(solution_number):
-    if solution_number is None:
-        return "!"
-    if type(solution_number) is int and solution_number > 0:
-        return f"! {solution_number}"
-    raise ValueError("solutionNumber must be a positive integer.")
-
-
-def normalize_solutions(solutions):
-    return [normalize_solution(solution) for solution in solutions]
-
-
-def solution_from_representative_plan(actions):
-    facets = []
-    for timestep, action in enumerate(actions, start=1):
-        name = action["name"]
-        arguments = list(action.get("params", []))
-        atom_arguments = ",".join(f'"{token}"' for token in [name, *arguments])
-        facets.append(
-            {
-                "id": f"occurs(action(({atom_arguments})),{timestep})",
-                "action": name,
-                "arguments": arguments,
-                "timestep": timestep,
-                "selectionState": "Not selected",
-            }
-        )
-    return {"label": "solution 1", "facets": facets}
-
-
-def normalize_solution(solution):
-    raw_facets = [
-        facet
-        for facet in solution.get("facets", [])
-        if not is_abstract_facet(facet)
-    ]
-    raw_facets.sort(
-        key=lambda facet: (
-            facet.get("timestep") is None,
-            facet.get("timestep") or 0,
-            facet.get("id", ""),
-        )
-    )
-
-    facets = []
-    previous_facet_id = None
-    for raw_facet in raw_facets:
-        normalized = normalize_facet(
-            raw_facet,
-            facet_type="plan",
-            parent_id=previous_facet_id,
-        )
-        facets.append(normalized)
-        previous_facet_id = normalized["id"]
-
+def availability_direction(available):
     return {
-        "label": solution.get("label", ""),
-        "facets": facets,
+        "available": available,
+        "plansRemaining": None,
+        "planReduction": None,
     }
 
 

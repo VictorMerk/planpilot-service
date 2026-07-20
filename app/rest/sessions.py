@@ -17,7 +17,9 @@ from ..service.session_registry import (
     SessionConfiguration,
     SessionCapacityError,
     SessionExpiredError,
+    SessionHorizonError,
     SessionNotFoundError,
+    SessionRevisionConflictError,
     SessionSelectionConflictError,
     session_registry,
 )
@@ -76,6 +78,7 @@ def create_session():
             jsonify(
                 {
                     **session.to_response(),
+                    "solutionCount": session.solution_count,
                     "facets": session.facets,
                 }
             ),
@@ -89,6 +92,18 @@ def create_session():
         return plan_space_too_large()
     except SessionCapacityError as error:
         return service_at_capacity(error)
+    except SessionHorizonError as error:
+        return (
+            jsonify({
+                "error": {
+                    "message": str(error),
+                    "code": "HORIZON_LIMIT_EXCEEDED",
+                    "minimumHorizon": error.minimum_horizon,
+                    "maximumHorizon": error.maximum_horizon,
+                }
+            }),
+            422,
+        )
     except Exception as error:
         return planpilot_failed(error)
 
@@ -118,8 +133,7 @@ def list_facets(session_id):
 
     try:
         session = session_registry.get_session(session_id)
-        facets = session.list_facets()
-        return jsonify({**session.to_response(), "facets": facets}), 200
+        return jsonify(session.list_facets_response()), 200
     except SessionExpiredError:
         return session_expired()
     except SessionNotFoundError:
@@ -140,17 +154,18 @@ def select_facet(session_id):
 
     try:
         session = session_registry.get_session(session_id)
-        facets = session.select_facet(
+        response = session.select_facet(
             payload["facetId"],
             payload["selectionState"],
             payload.get("previousSelectionState"),
+            payload.get("expectedSelectionRevision"),
         )
-        return jsonify({**session.to_response(), "facets": facets}), 200
+        return jsonify(response), 200
     except SessionExpiredError:
         return session_expired()
     except SessionNotFoundError:
         return session_not_found()
-    except SessionSelectionConflictError as error:
+    except (SessionSelectionConflictError, SessionRevisionConflictError) as error:
         return selection_conflict(error)
     except ValueError as error:
         return invalid_request(str(error))
@@ -172,13 +187,16 @@ def apply_facets(session_id):
 
     try:
         session = session_registry.get_session(session_id)
-        facets = session.apply_selections(payload["selections"])
-        return jsonify({**session.to_response(), "facets": facets}), 200
+        response = session.apply_selections(
+            payload["selections"],
+            payload.get("expectedSelectionRevision"),
+        )
+        return jsonify(response), 200
     except SessionExpiredError:
         return session_expired()
     except SessionNotFoundError:
         return session_not_found()
-    except SessionSelectionConflictError as error:
+    except (SessionSelectionConflictError, SessionRevisionConflictError) as error:
         return selection_conflict(error)
     except ValueError as error:
         return invalid_request(str(error))
@@ -200,16 +218,22 @@ def query_session(session_id):
 
     try:
         session = session_registry.get_session(session_id)
-        result = session.query(payload["type"], payload.get("solutionNumber"))
-        return jsonify({**session.to_response(), "result": result}), 200
+        response = session.query_response(
+            payload["type"],
+            payload.get("solutionNumber"),
+            payload.get("facetId"),
+        )
+        return jsonify(response), 200
     except SessionExpiredError:
         return session_expired()
     except SessionNotFoundError:
         return session_not_found()
-    except ValueError as error:
-        return invalid_request(str(error))
     except PlanpilotCapacityError:
         return plan_space_too_large()
+    except PlanpilotNoPlanError:
+        return no_plan()
+    except ValueError as error:
+        return invalid_request(str(error))
     except Exception as error:
         return planpilot_failed(error)
 
@@ -303,6 +327,10 @@ def is_pddl_token(value):
 
 
 def validate_select_facet_payload(payload):
+    return validate_facet_selection(payload, allow_expected_revision=True)
+
+
+def validate_facet_selection(payload, allow_expected_revision=False):
     if not isinstance(payload, dict):
         return "Request body must be a JSON object."
 
@@ -324,6 +352,20 @@ def validate_select_facet_payload(payload):
     }:
         return "previousSelectionState must be neutral, positive, or negative."
 
+    if allow_expected_revision:
+        revision_error = validate_expected_selection_revision(payload)
+        if revision_error:
+            return revision_error
+
+    return None
+
+
+def validate_expected_selection_revision(payload):
+    expected_revision = payload.get("expectedSelectionRevision")
+    if expected_revision is not None and (
+        type(expected_revision) is not int or expected_revision < 0
+    ):
+        return "expectedSelectionRevision must be a non-negative integer."
     return None
 
 
@@ -335,9 +377,12 @@ def validate_apply_facets_payload(payload):
         return "selections must be a non-empty array."
     if len(selections) > 50:
         return "At most 50 facet selections can be applied at once."
+    revision_error = validate_expected_selection_revision(payload)
+    if revision_error:
+        return revision_error
     seen_ids = set()
     for selection in selections:
-        error = validate_select_facet_payload(selection)
+        error = validate_facet_selection(selection)
         if error:
             return error
         facet_id = selection["facetId"]
@@ -355,20 +400,34 @@ def validate_query_payload(payload):
         "facets",
         "facetCount",
         "facetReduction",
+        "impliedFacets",
         "solution",
         "solutionCount",
         "solutionReduction",
+        "selectionImpact",
     }:
-        return "type must be facets, facetCount, facetReduction, solution, solutionCount, or solutionReduction."
+        return "type must be facets, facetCount, facetReduction, impliedFacets, solution, solutionCount, solutionReduction, or selectionImpact."
 
     solution_number = payload.get("solutionNumber")
     if solution_number is not None and (
-        type(solution_number) is not int or solution_number <= 0
+        type(solution_number) is not int
+        or solution_number <= 0
+        or solution_number > 9_007_199_254_740_991
     ):
-        return "solutionNumber must be a positive integer."
+        return "solutionNumber must be a positive safe integer."
+
+    if payload.get("type") == "solution" and solution_number is None:
+        return "solutionNumber is required for solution queries."
 
     if payload.get("type") != "solution" and solution_number is not None:
         return "solutionNumber is only supported for solution queries."
+
+    facet_id = payload.get("facetId")
+    if payload.get("type") == "selectionImpact":
+        if not is_non_empty_string(facet_id):
+            return "facetId is required for selectionImpact queries."
+    elif facet_id is not None:
+        return "facetId is only supported for selectionImpact queries."
 
     return None
 
@@ -420,7 +479,7 @@ def no_plan(status=422):
 def plan_space_too_large():
     return error_response(
         "PLAN_SPACE_TOO_LARGE",
-        "PlanPilot did not finish in time. Try a smaller horizon or exact mode at the plan length.",
+        "PlanPilot did not finish this operation within its processing limit.",
         503,
     )
 

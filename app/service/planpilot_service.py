@@ -19,11 +19,11 @@ _lp_locks_guard = threading.Lock()
 
 
 class PlanpilotNoPlanError(RuntimeError):
-    """The configured PlanPilot space contains no non-empty plan."""
+    pass
 
 
 class PlanpilotCapacityError(RuntimeError):
-    """The requested plan space exceeded a bounded solver resource."""
+    pass
 
 
 class PlanpilotService:
@@ -126,16 +126,19 @@ class PlanpilotService:
         output = self.send_command("?")
         return output
 
-    def send_command(self, command: str, no_Output: bool = False) -> str:
+    def send_command(
+        self,
+        command: str,
+        no_Output: bool = False,
+        timeout_seconds: float = None,
+    ) -> str:
         if not self.process:
             raise RuntimeError("FASB process not running")
 
         with self.lock:
             try:
-                # FASB omits its interactive prompt when stdout is a pipe. A
-                # read-only count query is therefore appended as an explicit
-                # response marker. Commands are processed in order, so this
-                # marker can only arrive after the requested command is done.
+                # FASB prints no prompt when stdout is piped. The count query
+                # marks the end of the response.
                 self.output_buffer.clear()
                 normalized_command = command.strip()
                 expected_numeric_lines = fasb_expected_numeric_lines(
@@ -143,7 +146,11 @@ class PlanpilotService:
                 )
                 self.process.stdin.write(command + "\n#?\n")
                 self.process.stdin.flush()
-                response_timeout = fasb_response_timeout_seconds()
+                response_timeout = (
+                    fasb_response_timeout_seconds()
+                    if timeout_seconds is None
+                    else max(float(timeout_seconds), 0.1)
+                )
                 response_started_at = time.monotonic()
 
                 while count_numeric_response_lines(self.output_buffer) < expected_numeric_lines:
@@ -195,8 +202,12 @@ class PlanpilotService:
                     f"Unexpected error communicating with FASB or parsing output: {e}"
                 )
 
-    def get_representative_solution(self, required=False):
-        solutions = self.send_command("! 1")
+    def get_representative_solution(self, required=False, timeout_seconds=None):
+        solutions = (
+            self.send_command("! 1")
+            if timeout_seconds is None
+            else self.send_command("! 1", timeout_seconds=timeout_seconds)
+        )
         solution = self._validate_representative_solution(solutions)
         if solution is None and required:
             raise PlanpilotNoPlanError(
@@ -232,7 +243,7 @@ class PlanpilotService:
             "facets": sorted(concrete_facets, key=lambda facet: facet["timestep"]),
         }
 
-    def restart_FASB(self):
+    def restart_FASB(self, timeout_seconds=None):
         if (
             self.last_sas_file_path is None
             or self.last_hash_value is None
@@ -294,7 +305,7 @@ class PlanpilotService:
             )
             self.reader_thread.start()
 
-        self._wait_for_fasb_ready()
+        self._wait_for_fasb_ready(timeout_seconds)
 
         return self.process
 
@@ -314,17 +325,16 @@ class PlanpilotService:
 
     @staticmethod
     def _read_stdout(process, output_buffer):
-        """Read stdout for the process that started this thread.
-
-        Passing the process keeps an old reader away from a restarted solver.
-        """
+        """Read one process so an old reader cannot consume output after a restart."""
         while process.stdout:
             line = process.stdout.readline()
             if not line:
                 break
             output_buffer.append(line)
 
-    def _wait_for_fasb_ready(self, timeout: float = 5.0) -> None:
+    def _wait_for_fasb_ready(self, timeout: float = None) -> None:
+        timeout = fasb_response_timeout_seconds() if timeout is None else timeout
+        timeout = max(float(timeout), 0.1)
         start_time = time.time()
         while time.time() - start_time < timeout:
             with self.lock:
@@ -472,10 +482,7 @@ def normalized_numeric_response(line):
 
 
 def fasb_expected_numeric_lines(command):
-    """Return the expected numeric-line count, including the appended marker.
-
-    Count commands produce one extra numeric line of their own.
-    """
+    """Count numeric lines from the command and response marker."""
     if command in {"#!", "#?"}:
         return 2
     if (
@@ -505,6 +512,17 @@ def fasb_response_timeout_seconds():
         return min(max(float(raw_value), 1.0), 150.0)
     except ValueError:
         return 30.0
+
+
+def fasb_impact_timeout_seconds():
+    raw_value = os.environ.get("PLANPILOT_FASB_IMPACT_TIMEOUT_SECONDS", "5")
+    try:
+        return min(
+            max(float(raw_value), 0.5),
+            fasb_response_timeout_seconds(),
+        )
+    except ValueError:
+        return min(5.0, fasb_response_timeout_seconds())
 
 
 def planpilot_max_horizon():
