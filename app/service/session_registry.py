@@ -41,6 +41,9 @@ class SessionContext:
     configuration: SessionConfiguration
     service: PlanpilotService
     facets: List[Dict]
+    # Ordered fasb literals ('atom' / '~atom') currently activated. Needed to
+    # undo arbitrary selections: fasb's '-' only pops the latest activation.
+    active_selections: List[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: utc_now())
     last_access_at: datetime = field(default_factory=lambda: utc_now())
     expires_at: datetime = field(default_factory=lambda: utc_now() + session_ttl())
@@ -67,9 +70,23 @@ class SessionContext:
         return self.facets
 
     def select_facet(self, facet_id: str, selection_state: str, previous_state=None):
-        command = build_selection_command(facet_id, selection_state, previous_state)
-        if command:
-            self.service.send_command(command, no_Output=True)
+        if selection_state not in ("positive", "negative", "neutral"):
+            raise ValueError("Unsupported facet selection state.")
+
+        previous_literal = build_selection_literal(facet_id, previous_state)
+        if previous_literal in self.active_selections:
+            # fasb's '-' only pops the most recent activation, so undoing an
+            # older selection means clearing the route and replaying the rest.
+            self.active_selections.remove(previous_literal)
+            self.service.send_command("--", no_Output=True)
+            for literal in self.active_selections:
+                self.service.send_command(f"+ {literal}", no_Output=True)
+
+        new_literal = build_selection_literal(facet_id, selection_state)
+        if new_literal and new_literal not in self.active_selections:
+            self.service.send_command(f"+ {new_literal}", no_Output=True)
+            self.active_selections.append(new_literal)
+
         self.facets = self.list_facets()
         return self.facets
 
@@ -242,18 +259,12 @@ def normalize_selection_state(selection_state):
     return "neutral"
 
 
-def build_selection_command(facet_id: str, selection_state: str, previous_state=None):
+def build_selection_literal(facet_id: str, selection_state):
     if selection_state == "positive":
-        return f"+ {facet_id}"
+        return facet_id
     if selection_state == "negative":
-        return f"+ ~{facet_id}"
-    if selection_state == "neutral":
-        if previous_state == "positive":
-            return f"- {facet_id}"
-        if previous_state == "negative":
-            return f"- ~{facet_id}"
-        return None
-    raise ValueError("Unsupported facet selection state.")
+        return f"~{facet_id}"
+    return None
 
 
 def build_solution_command(solution_number):
