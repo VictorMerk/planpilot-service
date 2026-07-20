@@ -44,6 +44,10 @@ class SessionContext:
     # Ordered fasb literals ('atom' / '~atom') currently activated. Needed to
     # undo arbitrary selections: fasb's '-' only pops the latest activation.
     active_selections: List[str] = field(default_factory=list)
+    # Length of the Fast Downward plan the session was built from.
+    min_horizon: int = None
+    # Incremented on every applied selection change (optimistic concurrency).
+    selection_revision: int = 0
     created_at: datetime = field(default_factory=lambda: utc_now())
     last_access_at: datetime = field(default_factory=lambda: utc_now())
     expires_at: datetime = field(default_factory=lambda: utc_now() + session_ttl())
@@ -63,13 +67,53 @@ class SessionContext:
             "createdAt": to_iso(self.created_at),
             "lastAccessAt": to_iso(self.last_access_at),
             "expiresAt": to_iso(self.expires_at),
+            "hasPlan": self.min_horizon is not None,
+            "minimumHorizon": self.min_horizon,
+            "selectionRevision": self.selection_revision,
+            "solutionCount": self.solution_count(),
+            "solution": self.current_solution(),
         }
+
+    # Shared response fields the IPEXCO backend expects on every reply.
+    def envelope(self):
+        return {
+            "sessionId": self.session_id,
+            "expiresAt": to_iso(self.expires_at),
+            "selectionRevision": self.selection_revision,
+            "solutionCount": self.solution_count(),
+        }
+
+    def solution_count(self):
+        count = normalize_count(self.service.send_command("#!"))
+        return count if count > 0 else None
+
+    # A representative plan consistent with the current selections.
+    def current_solution(self):
+        solutions = normalize_solutions(self.service.send_command("! 1"))
+        return solutions[0] if solutions else None
 
     def list_facets(self):
         self.facets = normalize_facets(self.service.send_command("?"))
         return self.facets
 
     def select_facet(self, facet_id: str, selection_state: str, previous_state=None):
+        self._apply_selection(facet_id, selection_state, previous_state)
+        self.selection_revision += 1
+        self.facets = self.list_facets()
+        return self.facets
+
+    def apply_selections(self, selections):
+        for selection in selections:
+            self._apply_selection(
+                selection["facetId"],
+                selection["selectionState"],
+                selection.get("previousSelectionState"),
+            )
+        self.selection_revision += 1
+        self.facets = self.list_facets()
+        return self.facets
+
+    def _apply_selection(self, facet_id: str, selection_state: str, previous_state=None):
         if selection_state not in ("positive", "negative", "neutral"):
             raise ValueError("Unsupported facet selection state.")
 
@@ -87,10 +131,9 @@ class SessionContext:
             self.service.send_command(f"+ {new_literal}", no_Output=True)
             self.active_selections.append(new_literal)
 
-        self.facets = self.list_facets()
-        return self.facets
-
-    def query(self, query_type: str, solution_number=None):
+    def query(self, query_type: str, solution_number=None, facet_id=None):
+        if query_type == "selectionImpact":
+            return self._selection_impact(facet_id)
         if query_type == "facets":
             return {"type": query_type, "facets": self.list_facets()}
         if query_type == "facetCount":
@@ -131,6 +174,42 @@ class SessionContext:
             return {"type": query_type, "facets": facets}
         raise ValueError("Unsupported PlanPilot query type.")
 
+    # How enforcing (require) or forbidding one facet would change the plan
+    # set, computed from fasb's '#!!' (answer set counts under each facet).
+    def _selection_impact(self, facet_id):
+        if not facet_id:
+            raise ValueError("facetId is required for selectionImpact queries.")
+
+        reduction_facets = normalize_facets(self.service.send_command("#!!"))
+        match = next(
+            (facet for facet in reduction_facets if facet["id"] == facet_id), None
+        )
+
+        def direction(sign):
+            remaining = ((match or {}).get("remaining") or {}).get("solution", {})
+            reduction = ((match or {}).get("reduction") or {}).get("solution", {})
+            if remaining.get(sign) is None:
+                return {
+                    "available": False,
+                    "plansRemaining": None,
+                    "planReduction": None,
+                }
+            return {
+                "available": True,
+                "plansRemaining": int(remaining[sign]),
+                "planReduction": reduction.get(sign),
+            }
+
+        return {
+            "type": "selectionImpact",
+            "facetId": facet_id,
+            "exact": True,
+            "comparableToCurrent": True,
+            "totalPlans": self.solution_count(),
+            "require": direction("positive"),
+            "forbid": direction("negative"),
+        }
+
     def stop(self):
         self.service.stop_fasb()
 
@@ -168,6 +247,7 @@ class SessionRegistry:
             configuration=configuration,
             service=service,
             facets=normalize_facets(facets),
+            min_horizon=artifacts.get("horizon") or None,
         )
 
         with self._lock:
@@ -282,12 +362,28 @@ def build_solution_command(solution_number):
 
 def normalize_solutions(solutions):
     return [
-        {
-            "label": solution.get("label", ""),
-            "facets": normalize_facets(solution.get("facets", [])),
-        }
+        chain_solution_facets(
+            {
+                "label": solution.get("label", ""),
+                "facets": normalize_facets(solution.get("facets", [])),
+            }
+        )
         for solution in solutions
     ]
+
+
+# The IPEXCO backend expects solution facets ordered by timestep and chained:
+# every facet after the first references its predecessor via parentId.
+def chain_solution_facets(solution):
+    solution["facets"] = sorted(
+        solution["facets"], key=lambda facet: facet["timestep"] or 0
+    )
+    previous_id = None
+    for facet in solution["facets"]:
+        if previous_id is not None:
+            facet["parentId"] = previous_id
+        previous_id = facet["id"]
+    return solution
 
 
 def session_ttl():

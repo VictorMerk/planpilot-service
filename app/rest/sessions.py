@@ -69,8 +69,15 @@ def list_facets(session_id):
 
     try:
         session = session_registry.get_session(session_id)
+        facets = session.list_facets()
         return (
-            jsonify({"sessionId": session.session_id, "facets": session.list_facets()}),
+            jsonify(
+                {
+                    **session.envelope(),
+                    "solution": session.current_solution(),
+                    "facets": facets,
+                }
+            ),
             200,
         )
     except SessionExpiredError:
@@ -91,13 +98,56 @@ def select_facet(session_id):
 
     try:
         session = session_registry.get_session(session_id)
+        revision_error = check_selection_revision(session, payload)
+        if revision_error:
+            return revision_error
         facets = session.select_facet(
             payload["facetId"],
             payload["selectionState"],
             payload.get("previousSelectionState"),
         )
         return (
-            jsonify({"sessionId": session.session_id, "facets": facets}),
+            jsonify(
+                {
+                    **session.envelope(),
+                    "solution": session.current_solution(),
+                    "facets": facets,
+                }
+            ),
+            200,
+        )
+    except SessionExpiredError:
+        return session_expired()
+    except SessionNotFoundError:
+        return session_not_found()
+    except ValueError as error:
+        return invalid_request(str(error))
+    except Exception as error:
+        return planpilot_failed(error)
+
+
+@sessions_bp.route("/sessions/<session_id>/facets/apply", methods=["POST"])
+@require_service_auth
+def apply_facets(session_id):
+    payload = request.get_json(silent=True)
+    validation_error = validate_apply_facets_payload(payload)
+    if validation_error:
+        return invalid_request(validation_error)
+
+    try:
+        session = session_registry.get_session(session_id)
+        revision_error = check_selection_revision(session, payload)
+        if revision_error:
+            return revision_error
+        facets = session.apply_selections(payload["selections"])
+        return (
+            jsonify(
+                {
+                    **session.envelope(),
+                    "solution": session.current_solution(),
+                    "facets": facets,
+                }
+            ),
             200,
         )
     except SessionExpiredError:
@@ -120,8 +170,12 @@ def query_session(session_id):
 
     try:
         session = session_registry.get_session(session_id)
-        result = session.query(payload["type"], payload.get("solutionNumber"))
-        return jsonify({"sessionId": session.session_id, "result": result}), 200
+        result = session.query(
+            payload["type"],
+            payload.get("solutionNumber"),
+            payload.get("facetId"),
+        )
+        return jsonify({**session.envelope(), "result": result}), 200
     except SessionExpiredError:
         return session_expired()
     except SessionNotFoundError:
@@ -179,21 +233,21 @@ def validate_create_session_payload(payload):
     return None
 
 
-def validate_select_facet_payload(payload):
-    if not isinstance(payload, dict):
-        return "Request body must be a JSON object."
+def validate_selection(selection):
+    if not isinstance(selection, dict):
+        return "Each selection must be a JSON object."
 
-    if not is_non_empty_string(payload.get("facetId")):
+    if not is_non_empty_string(selection.get("facetId")):
         return "facetId is required."
 
-    if payload.get("selectionState") not in {
+    if selection.get("selectionState") not in {
         "neutral",
         "positive",
         "negative",
     }:
         return "selectionState must be neutral, positive, or negative."
 
-    previous_state = payload.get("previousSelectionState")
+    previous_state = selection.get("previousSelectionState")
     if previous_state is not None and previous_state not in {
         "neutral",
         "positive",
@@ -201,6 +255,51 @@ def validate_select_facet_payload(payload):
     }:
         return "previousSelectionState must be neutral, positive, or negative."
 
+    return None
+
+
+def validate_selection_revision(payload):
+    expected = payload.get("expectedSelectionRevision")
+    if expected is not None and (type(expected) is not int or expected < 0):
+        return "expectedSelectionRevision must be a non-negative integer."
+    return None
+
+
+def validate_select_facet_payload(payload):
+    if not isinstance(payload, dict):
+        return "Request body must be a JSON object."
+
+    return validate_selection(payload) or validate_selection_revision(payload)
+
+
+def validate_apply_facets_payload(payload):
+    if not isinstance(payload, dict):
+        return "Request body must be a JSON object."
+
+    selections = payload.get("selections")
+    if not isinstance(selections, list) or not 1 <= len(selections) <= 50:
+        return "selections must contain between 1 and 50 entries."
+
+    facet_ids = set()
+    for selection in selections:
+        selection_error = validate_selection(selection)
+        if selection_error:
+            return selection_error
+        if selection["facetId"] in facet_ids:
+            return "Each facetId may occur only once."
+        facet_ids.add(selection["facetId"])
+
+    return validate_selection_revision(payload)
+
+
+def check_selection_revision(session, payload):
+    expected = payload.get("expectedSelectionRevision")
+    if expected is not None and expected != session.selection_revision:
+        return error_response(
+            "SELECTION_REVISION_CONFLICT",
+            "Selection revision does not match the session.",
+            409,
+        )
     return None
 
 
@@ -216,8 +315,12 @@ def validate_query_payload(payload):
         "solutionCount",
         "solutionReduction",
         "impliedFacets",
+        "selectionImpact",
     }:
-        return "type must be facets, facetCount, facetReduction, solution, solutionCount, solutionReduction, or impliedFacets."
+        return (
+            "type must be facets, facetCount, facetReduction, solution, "
+            "solutionCount, solutionReduction, impliedFacets, or selectionImpact."
+        )
 
     solution_number = payload.get("solutionNumber")
     if solution_number is not None and (
@@ -227,6 +330,11 @@ def validate_query_payload(payload):
 
     if payload.get("type") != "solution" and solution_number is not None:
         return "solutionNumber is only supported for solution queries."
+
+    if payload.get("type") == "selectionImpact" and not is_non_empty_string(
+        payload.get("facetId")
+    ):
+        return "facetId is required for selectionImpact queries."
 
     return None
 
