@@ -121,11 +121,14 @@ class SessionContext:
             }
         if query_type == "impliedFacets":
             # '|= %' returns the facets entailed by the current decisions, i.e.
-            # the landmarks that hold in every remaining solution.
-            return {
-                "type": query_type,
-                "facets": normalize_facets(self.service.send_command("|= %")),
-            }
+            # the landmarks that hold in every remaining solution. The IPEXCO
+            # backend requires implied facets to be neutral, read-only markers.
+            facets = normalize_facets(self.service.send_command("|= %"))
+            for facet in facets:
+                facet["facetType"] = "implied"
+                facet["selectable"] = False
+                facet["selectionState"] = "neutral"
+            return {"type": query_type, "facets": facets}
         raise ValueError("Unsupported PlanPilot query type.")
 
     def stop(self):
@@ -226,6 +229,8 @@ def normalize_facet(facet):
         "id": facet["id"],
         "label": label or facet["id"],
         "timestep": timestep if timestep else None,
+        # The IPEXCO backend requires abstractTimeStep to mirror a null timestep.
+        "abstractTimeStep": not timestep,
         "selectionState": normalize_selection_state(facet.get("selectionState")),
     }
 
