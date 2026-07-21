@@ -384,9 +384,12 @@ def normalize_solutions(solutions):
 
 # The IPEXCO backend expects solution facets ordered by timestep and chained:
 # every facet after the first references its predecessor via parentId.
+# In abstract time mode fasb also reports occurs_sometime atoms, which merely
+# echo the concrete steps without a timestep, so they are dropped here.
 def chain_solution_facets(solution):
     solution["facets"] = sorted(
-        solution["facets"], key=lambda facet: facet["timestep"] or 0
+        (facet for facet in solution["facets"] if facet["timestep"] is not None),
+        key=lambda facet: facet["timestep"],
     )
     previous_id = None
     for facet in solution["facets"]:
