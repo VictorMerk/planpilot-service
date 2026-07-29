@@ -1,7 +1,16 @@
 lib/downward/builds
 .venv
+.git
+.pytest_cache
+.mypy_cache
 __pycache__
+**/__pycache__
 *.pyc
+.coverage
 .env
 instance
 temp
+lib/planpilot/experiments
+lib/planpilot/bin/fasb
+lib/planpilot/bin/fasb_interpreter
+lib/planpilot/bin/fasb-x86_64-unknown-linux-gnu/fasb-x86_64-unknown-linux-gnu
