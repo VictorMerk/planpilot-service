@@ -26,12 +26,16 @@ class SessionConfiguration:
     horizon: int
     encoding: str
     abstract_time_steps: bool
+    state_facets: bool = False
 
     def to_response(self):
+        # The IPEXCO backend persists this configuration verbatim, and its run
+        # schema requires stateFacets, so every field the caller sent is echoed.
         return {
             "horizon": self.horizon,
             "encoding": self.encoding,
             "abstractTimeSteps": self.abstract_time_steps,
+            "stateFacets": self.state_facets,
         }
 
 
@@ -238,6 +242,7 @@ class SessionRegistry:
                 horizon=plan_length,
                 encoding=configuration.encoding,
                 abstract_time_steps=configuration.abstract_time_steps,
+                state_facets=configuration.state_facets,
             )
 
         service = PlanpilotService()

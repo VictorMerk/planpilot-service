@@ -344,6 +344,7 @@ def get_configuration(configuration):
         horizon=configuration["horizon"],
         encoding=configuration["encoding"],
         abstract_time_steps=configuration["abstractTimeSteps"],
+        state_facets=bool(configuration.get("stateFacets", False)),
     )
 
 
