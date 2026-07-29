@@ -148,6 +148,7 @@ class PlanpilotService:
 
         with self.lock:
             try:
+                process = self.process
                 # FASB prints no prompt when stdout is piped. The count query
                 # marks the end of the response.
                 self.output_buffer.clear()
@@ -155,8 +156,8 @@ class PlanpilotService:
                 expected_numeric_lines = fasb_expected_numeric_lines(
                     normalized_command
                 )
-                self.process.stdin.write(command + "\n#?\n")
-                self.process.stdin.flush()
+                process.stdin.write(command + "\n#?\n")
+                process.stdin.flush()
                 response_timeout = (
                     fasb_response_timeout_seconds()
                     if timeout_seconds is None
@@ -165,7 +166,9 @@ class PlanpilotService:
                 response_started_at = time.monotonic()
 
                 while count_numeric_response_lines(self.output_buffer) < expected_numeric_lines:
-                    poll = getattr(self.process, "poll", None)
+                    if self.process is not process:
+                        raise RuntimeError("FASB operation was interrupted.")
+                    poll = getattr(process, "poll", None)
                     if poll is not None and poll() is not None:
                         diagnostic = "".join(self.output_buffer[-20:]).strip()
                         self._stop_current_process()
@@ -546,6 +549,14 @@ def fasb_impact_timeout_seconds():
         )
     except ValueError:
         return min(5.0, fasb_response_timeout_seconds())
+
+
+def max_query_timeout_seconds():
+    raw_value = os.environ.get("PLANPILOT_MAX_QUERY_TIMEOUT_SECONDS", "300")
+    try:
+        return min(max(int(raw_value), 5), 300)
+    except ValueError:
+        return 300
 
 
 def planpilot_max_horizon():

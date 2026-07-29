@@ -10,6 +10,8 @@ from ..service.fastdownward_service import (
 from ..service.planpilot_service import (
     PlanpilotCapacityError,
     PlanpilotNoPlanError,
+    fasb_response_timeout_seconds,
+    max_query_timeout_seconds,
     planpilot_max_horizon,
 )
 from ..service.session_registry import (
@@ -18,10 +20,14 @@ from ..service.session_registry import (
     SessionCapacityError,
     SessionExpiredError,
     SessionHorizonError,
+    SessionJobConflictError,
+    SessionJobNotFoundError,
     SessionNotFoundError,
     SessionRevisionConflictError,
     SessionSelectionConflictError,
     session_registry,
+    session_ttl,
+    solution_cache_limit,
 )
 from .auth import require_service_auth
 
@@ -56,6 +62,33 @@ def ready():
     if status == 503:
         response.headers["Retry-After"] = "5"
     return response, status
+
+
+@sessions_bp.route("/capabilities", methods=["GET"])
+@require_service_auth
+def capabilities():
+    capacity = session_registry.capacity_snapshot()
+    return jsonify(
+        {
+            "apiVersion": "1",
+            "asyncJobTypes": [
+                "solution",
+                "solutionCount",
+                "selectionImpact",
+            ],
+            "maxHorizon": planpilot_max_horizon(),
+            "maxActiveSessions": capacity["maxActiveSessions"],
+            "maxConcurrentCreations": capacity["maxConcurrentCreations"],
+            "sessionTtlSeconds": int(session_ttl().total_seconds()),
+            "maxCachedSolutions": solution_cache_limit(),
+            "defaultQueryTimeoutSeconds": int(fasb_response_timeout_seconds()),
+            "maxQueryTimeoutSeconds": max_query_timeout_seconds(),
+            "encodings": sorted(SUPPORTED_ENCODINGS),
+            "supportsAbstractTimeSteps": True,
+            "supportsStateFacets": True,
+            "supportsAsyncJobs": True,
+        }
+    ), 200
 
 
 @sessions_bp.route("/sessions", methods=["POST"])
@@ -223,13 +256,17 @@ def query_session(session_id):
             payload.get("solutionNumber"),
             payload.get("facetId"),
         )
+        query_options = {}
+        if "timeoutSeconds" in payload:
+            query_options["timeout_seconds"] = payload["timeoutSeconds"]
         if "solutionMode" in payload:
+            query_options["solution_mode"] = payload["solutionMode"]
             response = session.query_response(
                 *query_arguments,
-                solution_mode=payload["solutionMode"],
+                **query_options,
             )
         else:
-            response = session.query_response(*query_arguments)
+            response = session.query_response(*query_arguments, **query_options)
         return jsonify(response), 200
     except SessionExpiredError:
         return session_expired()
@@ -241,6 +278,79 @@ def query_session(session_id):
         return no_plan()
     except ValueError as error:
         return invalid_request(str(error))
+    except Exception as error:
+        return planpilot_failed(error)
+
+
+@sessions_bp.route("/sessions/<session_id>/jobs", methods=["POST"])
+@require_service_auth
+def start_query_job(session_id):
+    payload = request.get_json(silent=True)
+    validation_error = validate_job_payload(payload)
+    if validation_error:
+        return invalid_request(validation_error)
+
+    try:
+        session = session_registry.get_session(session_id)
+        job_arguments = [
+            payload["type"],
+            payload.get("facetId"),
+            payload.get("expectedSelectionRevision"),
+            payload.get("solutionNumber"),
+            payload.get("solutionStart"),
+        ]
+        if "timeoutSeconds" in payload:
+            job_arguments.append(payload["timeoutSeconds"])
+        response = session.start_query_job(*job_arguments)
+        return jsonify({**response, "expiresAt": session.to_response()["expiresAt"]}), 202
+    except SessionExpiredError:
+        return session_expired()
+    except SessionNotFoundError:
+        return session_not_found()
+    except SessionRevisionConflictError as error:
+        return selection_conflict(error)
+    except SessionJobConflictError as error:
+        return error_response("JOB_CONFLICT", str(error), 409)
+    except ValueError as error:
+        return invalid_request(str(error))
+    except Exception as error:
+        return planpilot_failed(error)
+
+
+@sessions_bp.route("/sessions/<session_id>/jobs/<job_id>", methods=["GET"])
+@require_service_auth
+def get_query_job(session_id, job_id):
+    try:
+        session = session_registry.get_session(session_id)
+        return jsonify({
+            **session.get_query_job(job_id),
+            "expiresAt": session.to_response()["expiresAt"],
+        }), 200
+    except SessionExpiredError:
+        return session_expired()
+    except SessionNotFoundError:
+        return session_not_found()
+    except SessionJobNotFoundError:
+        return error_response("JOB_NOT_FOUND", "PlanPilot job was not found.", 404)
+    except Exception as error:
+        return planpilot_failed(error)
+
+
+@sessions_bp.route("/sessions/<session_id>/jobs/<job_id>", methods=["DELETE"])
+@require_service_auth
+def cancel_query_job(session_id, job_id):
+    try:
+        session = session_registry.get_session(session_id)
+        return jsonify({
+            **session.cancel_query_job(job_id),
+            "expiresAt": session.to_response()["expiresAt"],
+        }), 200
+    except SessionExpiredError:
+        return session_expired()
+    except SessionNotFoundError:
+        return session_not_found()
+    except SessionJobNotFoundError:
+        return error_response("JOB_NOT_FOUND", "PlanPilot job was not found.", 404)
     except Exception as error:
         return planpilot_failed(error)
 
@@ -446,6 +556,58 @@ def validate_query_payload(payload):
     elif facet_id is not None:
         return "facetId is only supported for selectionImpact queries."
 
+    return validate_query_timeout(payload)
+
+
+def validate_job_payload(payload):
+    if not isinstance(payload, dict):
+        return "Request body must be a JSON object."
+    if payload.get("type") not in {
+        "solution",
+        "solutionCount",
+        "selectionImpact",
+    }:
+        return "type must be solution, solutionCount, or selectionImpact."
+    facet_id = payload.get("facetId")
+    if payload["type"] == "selectionImpact" and not is_non_empty_string(facet_id):
+        return "facetId is required for selectionImpact jobs."
+    if payload["type"] != "selectionImpact" and facet_id is not None:
+        return "facetId is only supported for selectionImpact jobs."
+    solution_number = payload.get("solutionNumber")
+    if payload["type"] == "solution" and (
+        type(solution_number) is not int
+        or solution_number <= 0
+        or solution_number > 9_007_199_254_740_991
+    ):
+        return "solutionNumber is required for solution jobs and must be a positive safe integer."
+    if payload["type"] != "solution" and solution_number is not None:
+        return "solutionNumber is only supported for solution jobs."
+    solution_start = payload.get("solutionStart")
+    if solution_start is not None and (
+        payload["type"] != "solution"
+        or type(solution_start) is not int
+        or solution_start <= 0
+        or solution_start > solution_number
+    ):
+        return "solutionStart must be a positive integer no greater than solutionNumber."
+    return validate_expected_selection_revision(payload) or validate_query_timeout(
+        payload
+    )
+
+
+def validate_query_timeout(payload):
+    timeout_seconds = payload.get("timeoutSeconds")
+    if timeout_seconds is None:
+        return None
+    if (
+        type(timeout_seconds) is not int
+        or timeout_seconds < 5
+        or timeout_seconds > max_query_timeout_seconds()
+    ):
+        return (
+            "timeoutSeconds must be an integer between 5 and "
+            f"{max_query_timeout_seconds()}."
+        )
     return None
 
 

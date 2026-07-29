@@ -54,6 +54,16 @@ def normalize_facet(facet, facet_type=None, parent_id=None):
         normalized["reduction"] = facet["reduction"]
     if facet.get("remaining") is not None:
         normalized["remaining"] = facet["remaining"]
+    implied_by = facet.get("impliedBy")
+    if isinstance(implied_by, list):
+        normalized["impliedBy"] = [
+            related_id
+            for related_id in implied_by
+            if isinstance(related_id, str) and related_id
+        ]
+    caused_by = facet.get("causedBy")
+    if isinstance(caused_by, str) and caused_by:
+        normalized["causedBy"] = caused_by
 
     return normalized
 
