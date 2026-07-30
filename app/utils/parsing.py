@@ -1,9 +1,7 @@
 import re
 from typing import Dict, List
 
-# Action atoms: occurs(action(("...")),T) / occurs_sometime(action(("...")))
 OCCURS_PATTERN = r"(occurs(?:_sometime)?\(action\(\(([^)]+)\)\)(?:,(\d+))?\))"
-# State atoms: holds(variable(V), value("pred(args)", true|false), T)
 HOLDS_PATTERN = (
     r'(holds\(variable\((?:\d+|"[^"]*")\),\s*'
     r'value\("([^"]+)",\s*(true|false)\),\s*(\d+)\))'
@@ -16,6 +14,7 @@ def parse_facet_output(output: str, command: str) -> List[Dict]:
         return {
             "id": raw_id,
             "action": parts[0],
+            "arguments": parts[1:],
             "constant1": parts[1] if len(parts) > 1 else None,
             "constant2": parts[2] if len(parts) > 2 else None,
             "timestep": int(timestep),
@@ -31,15 +30,12 @@ def parse_facet_output(output: str, command: str) -> List[Dict]:
         }
 
     def make_holds_facet(value_str, truth, timestep, raw_id):
-        # The whole predicate (e.g. 'on(a,b)') is the label; negated values
-        # are prefixed so 'clear(a)' and '¬clear(a)' stay distinguishable.
-        # String constants arrive space-free (see _generate_lp_with_plasp),
-        # so re-insert a space after commas for readability.
         label = value_str.replace(",", ", ")
         label = label if truth == "true" else f"¬{label}"
         return {
             "id": raw_id,
             "action": label,
+            "arguments": [],
             "constant1": None,
             "constant2": None,
             "timestep": int(timestep),
@@ -107,7 +103,6 @@ def parse_facet_output(output: str, command: str) -> List[Dict]:
 
 def parse_solution_output(output: str) -> List[Dict]:
     solutions = []
-    action_id = 0
     solution_blocks = re.split(r"solution (\d+):", output.strip())
 
     for i in range(1, len(solution_blocks), 2):
@@ -128,6 +123,7 @@ def parse_solution_output(output: str) -> List[Dict]:
             action_dict = {
                 "id": full_match,
                 "action": action_type,
+                "arguments": parts[1:],
                 "constant1": const1,
                 "constant2": const2,
                 "timestep": ts,
@@ -135,7 +131,6 @@ def parse_solution_output(output: str) -> List[Dict]:
                 "remaining": None,
             }
             current_actions.append(action_dict)
-            action_id += 1
 
         solutions.append(
             {"label": f"solution {solution_number}", "facets": current_actions}
