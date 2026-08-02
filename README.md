@@ -28,7 +28,7 @@ amd64 emulation.
 - `GET /api/capabilities` returns the supported options and limits.
 - Session routes are available below `/api/sessions`.
 
-Except for the health endpoint, requests require:
+Except for the health and readiness endpoints, requests require:
 
 ```text
 Authorization: Bearer <API_KEY>
@@ -49,4 +49,6 @@ The most important environment variables are:
 ## Vendored software
 
 PlanPilot, Fast Downward and the FASB binary are included under `lib/`. Their
-licenses and upstream repositories are listed in `THIRD_PARTY.md`.
+licenses, upstream repositories and exact revisions are listed in
+`THIRD_PARTY.md`. The service repository is distributed under GPL-3.0; see
+`LICENSE.md`.
