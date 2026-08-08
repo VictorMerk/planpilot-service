@@ -15,3 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build --tag planpilot-service:ci .
+      - run: >-
+          docker run --rm --user 0:0 planpilot-service:ci
+          sh -c "pip install --no-cache-dir -r requirements-dev.txt &&
+          python -m pytest -q lib/planpilot/translate/tests"
