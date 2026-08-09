@@ -28,6 +28,18 @@ amd64 emulation.
 - `GET /api/capabilities` returns the supported options and limits.
 - Session routes are available below `/api/sessions`.
 
+Requests, responses, asynchronous jobs and error codes are documented in
+[`API.md`](API.md).
+
+The test suite includes route and lifecycle tests. `scripts/smoke_sessions.py`
+runs a small real session against a service at `http://127.0.0.1:5000` and is
+also executed by CI.
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q tests lib/planpilot/translate/tests
+```
+
 Except for the health and readiness endpoints, requests require:
 
 ```text
