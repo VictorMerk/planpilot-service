@@ -39,7 +39,7 @@ def wait_until_ready():
             status, _body = request("GET", "/api/ready", authenticated=False)
             if status == 200:
                 return
-        except URLError:
+        except (URLError, ConnectionError):
             pass
         time.sleep(1)
     raise RuntimeError("PlanPilot did not become ready within 60 seconds.")
